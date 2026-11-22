@@ -12,7 +12,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use backoff::{ExponentialBackoff, backoff::Backoff};
@@ -168,6 +168,7 @@ struct NvidiaSmi {
 pub(crate) struct Gpu {
     // Sampling state for `refresh_intel_usage`
     last_sample_at: Option<Instant>,
+    last_sample_wall: Option<SystemTime>,
     last_idle_ms: HashMap<PathBuf, u64>,
     advanced_idle: HashSet<PathBuf>,
 
@@ -180,6 +181,7 @@ impl Gpu {
     fn new() -> Self {
         Self {
             last_sample_at: None,
+            last_sample_wall: None,
             last_idle_ms: HashMap::new(),
             advanced_idle: HashSet::new(),
             temp: None,
@@ -378,7 +380,27 @@ impl Gpu {
     /// from C6/RC6 idle residency: busy ≈ 100 - idle_time_delta / wall_time_delta.
     fn refresh_intel_usage(&mut self) -> Option<u64> {
         let now = Instant::now();
+        let now_wall = SystemTime::now();
         let samples = Self::read_idle_residency_ms();
+
+        // RC6 counters can jump once across suspend/resume, even ones that
+        // never advance otherwise (e.g. the Meteor Lake media GT). `Instant`
+        // stops while suspended but wall-clock time does not, so skip a sample
+        // spanning a suspend instead of counting it as an advance.
+        let resumed =
+            self.last_sample_at
+                .zip(self.last_sample_wall)
+                .is_some_and(|(last, last_wall)| {
+                    now_wall
+                        .duration_since(last_wall)
+                        .is_ok_and(|wall| wall > now.duration_since(last) + Duration::from_secs(1))
+                });
+        self.last_sample_wall = Some(now_wall);
+        if resumed {
+            self.last_sample_at = Some(now);
+            self.last_idle_ms = samples;
+            return None;
+        }
 
         for (path, idle_ms) in &samples {
             if self
